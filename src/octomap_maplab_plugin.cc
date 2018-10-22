@@ -91,6 +91,8 @@ public:
             const pose_graph::VertexId &vertex_id = vertex->id();
             const size_t num_frames = vertex->numFrames();
             const aslam::VisualNFrame &nframe = vertex->getVisualNFrame();
+            const aslam::Transformation &T_G_M = vi_map->getMissionBaseFrameForMission(mission_id).get_T_G_M();
+            const aslam::Transformation T_G_I = T_G_M * vertex->get_T_M_I();
             for (size_t frame_idx = 0u; frame_idx < num_frames; ++frame_idx)
             {
               if (nframe.isFrameSet(frame_idx))
@@ -110,23 +112,26 @@ public:
                 octomap::Pointcloud cloud;
                 Eigen::Vector3d point;
                 Eigen::Vector3d pointWorld;
-                Eigen::Isometry3d T;
+                // Compute complete transformation.
+                const aslam::Transformation T_I_C = n_camera.get_T_C_B(frame_idx).inverse();
+                const aslam::Transformation T_G_C = T_G_I * T_I_C;
+                Eigen::Isometry3d T(T_G_C.getTransformationMatrix());
                 for (size_t index = 0u; index < point_cloud.size(); index++)
                 {
                   point[0] = point_cloud.xyz[0 + 3 * index];
                   point[1] = point_cloud.xyz[1 + 3 * index];
                   point[2] = point_cloud.xyz[2 + 3 * index];
 
-                  pointWorld = T*point;
+                  pointWorld = T * point;
                   cloud.push_back(pointWorld[0], pointWorld[1], pointWorld[2]);
                 }
-                tree.insertPointCloud(cloud, octomap::point3d(T(0,3), T(1,3), T(2,3)));
+                tree.insertPointCloud(cloud, octomap::point3d(T(0, 3), T(1, 3), T(2, 3)));
               }
             }
           });
           // write octomap to disk
           tree.updateInnerOccupancy();
-          tree.writeBinary( "octomap.bt" );
+          tree.writeBinary("octomap.bt");
 
           return common::kSuccess;
         },
