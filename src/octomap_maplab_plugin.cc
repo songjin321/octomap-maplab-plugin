@@ -1,16 +1,34 @@
 #include <iostream>
 #include <string>
+#include <algorithm>
+#include <type_traits>
+#include <unordered_map>
+#include <utility>
 
+#include <Eigen/Core>
+#include <aslam/common/pose-types.h>
 #include <console-common/console-plugin-base.h>
 #include <map-manager/map-manager.h>
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+#include <landmark-triangulation/pose-interpolator.h>
+#include <map-resources/resource-conversion.h>
+#include <maplab-common/progress-bar.h>
+#include <posegraph/unique-id.h>
+#include <vi-map/landmark.h>
+#include <vi-map/unique-id.h>
+#include <vi-map/vertex.h>
 #include <vi-map/vi-map.h>
+#include <voxblox/core/common.h>
+#include <voxblox/core/tsdf_map.h>
+#include <voxblox/integrator/tsdf_integrator.h>
 
 #include <octomap/octomap.h>
 #include <Eigen/Geometry>
 // Your new plugin needs to derive from ConsolePluginBase.
 // (Alternatively, you can derive from ConsolePluginBaseWithPlotter if you need
 // RViz plotting abilities for your VI map.)
-class HelloWorldPlugin : public common::ConsolePluginBase
+class OctoMapPlugin : public common::ConsolePluginBase
 {
 public:
   // Every plugin needs to implement a getPluginId function which returns a
@@ -22,7 +40,7 @@ public:
 
   // The constructor takes a pointer to the Console object which we can forward
   // to the constructor of ConsolePluginBase.
-  HelloWorldPlugin(common::Console *console)
+  OctoMapPlugin(common::Console *console)
       : common::ConsolePluginBase(console)
   {
     // You can add your commands in here.
@@ -53,7 +71,7 @@ public:
         common::Processing::Sync);
 
     addCommand(
-        {"convert_all_point_clouds_to_octomap"},
+        {"create_octomap"},
 
         [this]() -> int {
           // Get the currently selected map.
@@ -73,49 +91,148 @@ public:
           // Get and lock the map which blocks all other access to the map.
           vi_map::VIMapManager::MapWriteAccess map =
               map_manager.getMapWriteAccess(selected_map_key);
+          const vi_map::VIMap& vi_map = *map;
 
-          // Now run your algorithm on the VI map.
-          // convert all optimized point clouds to octomap
-          vi_map::VIMap *vi_map = map.get();
+          // get mission lists
+          vi_map::MissionIdList mission_ids;
+          map.get()->getAllMissionIdsSortedByTimestamp(&mission_ids);
 
+          // set resource type 17 pointcloudxyz
+          const backend::ResourceType input_resource_type = static_cast<backend::ResourceType>(
+                17);
           // octomap tree
           octomap::OcTree tree(0.05);
+          for (const vi_map::MissionId &mission_id : mission_ids)
+          {
+            VLOG(1) << "Integrating mission " << mission_id;
+            const vi_map::VIMission &mission = vi_map.getMission(mission_id);
 
-          CHECK_NOTNULL(vi_map);
-          vi_map->forEachVertex([&](vi_map::Vertex *vertex) {
-            CHECK_NOTNULL(vertex);
-            const vi_map::MissionId &mission_id = vertex->getMissionId();
-            const aslam::NCamera &n_camera =
-                vi_map->getSensorManager().getNCameraForMission(mission_id);
+            const aslam::Transformation &T_G_M =
+                vi_map.getMissionBaseFrameForMission(mission_id).get_T_G_M();
 
-            const pose_graph::VertexId &vertex_id = vertex->id();
-            const size_t num_frames = vertex->numFrames();
-            const aslam::VisualNFrame &nframe = vertex->getVisualNFrame();
-            const aslam::Transformation &T_G_M = vi_map->getMissionBaseFrameForMission(mission_id).get_T_G_M();
-            const aslam::Transformation T_G_I = T_G_M * vertex->get_T_M_I();
-            for (size_t frame_idx = 0u; frame_idx < num_frames; ++frame_idx)
+            // Check if there is IMU data to interpolate the optional sensor poses.
+            landmark_triangulation::VertexToTimeStampMap vertex_to_time_map;
+            int64_t min_timestamp_ns;
+            int64_t max_timestamp_ns;
+            const landmark_triangulation::PoseInterpolator pose_interpolator;
+            pose_interpolator.getVertexToTimeStampMap(
+                vi_map, mission_id, &vertex_to_time_map, &min_timestamp_ns,
+                &max_timestamp_ns);
+            if (vertex_to_time_map.empty())
             {
-              if (nframe.isFrameSet(frame_idx))
+              VLOG(2) << "Couldn't find any IMU data to interpolate exact optional "
+                      << "sensor position in mission " << mission_id;
+              continue;
+            }
+
+            LOG(INFO) << "All resources within this time range will be integrated: ["
+                      << min_timestamp_ns << "," << max_timestamp_ns << "]";
+
+            // Retrieve sensor id to resource id mapping.
+            typedef std::unordered_map<aslam::CameraId,
+                                       backend::OptionalSensorResources>
+                SensorsToResourceMap;
+
+            const SensorsToResourceMap *sensor_id_to_res_id_map;
+            sensor_id_to_res_id_map =
+                mission.getAllOptionalSensorResourceIdsOfType<aslam::CameraId>(
+                    input_resource_type);
+
+            if (sensor_id_to_res_id_map == nullptr)
+            {
+              continue;
+            }
+            VLOG(1) << "Found " << sensor_id_to_res_id_map->size()
+                    << " optional sensors with this depth type.";
+
+            // Integrate them one sensor at a time.
+            for (const typename SensorsToResourceMap::value_type &sensor_to_res_ids :
+                 *sensor_id_to_res_id_map)
+            {
+              const backend::OptionalSensorResources &resource_buffer =
+                  sensor_to_res_ids.second;
+
+              const aslam::CameraId &sensor_or_camera_id = sensor_to_res_ids.first;
+
+              // Get transformation between reference (e.g. IMU) and sensor.
+              aslam::Transformation T_I_S;
+              vi_map.getSensorManager().getSensorOrCamera_T_R_S(
+                  sensor_or_camera_id, &T_I_S);
+
+              const size_t num_resources = resource_buffer.size();
+              VLOG(1) << "Sensor " << sensor_or_camera_id.shortHex() << " has "
+                      << num_resources << " such resources.";
+
+              // Collect all timestamps that need to be interpolated.
+              Eigen::Matrix<int64_t, 1, Eigen::Dynamic> resource_timestamps(
+                  num_resources);
+              size_t idx = 0u;
+              for (const std::pair<int64_t, backend::ResourceId> &stamped_resource_id :
+                   resource_buffer)
               {
-                resources::PointCloud point_cloud;
-                if (vi_map->getPointCloudXYZ(*vertex, frame_idx, &point_cloud))
+                // If the resource timestamp does not lie within the min and max
+                // timestamp of the vertices, we cannot interpolate the position. To
+                // keep this efficient, we simply replace timestamps outside the range
+                // with the min or max. Since their transformation will not be used
+                // later, that's fine.
+                resource_timestamps[idx] = std::max(
+                    min_timestamp_ns,
+                    std::min(max_timestamp_ns, stamped_resource_id.first));
+
+                ++idx;
+              }
+
+              // Interpolate poses at resource timestamp.
+              aslam::TransformationVector poses_M_I;
+              pose_interpolator.getPosesAtTime(
+                  vi_map, mission_id, resource_timestamps, &poses_M_I);
+
+              CHECK_EQ(static_cast<int>(poses_M_I.size()), resource_timestamps.size());
+              CHECK_EQ(poses_M_I.size(), resource_buffer.size());
+
+              // Retrieve and integrate all resources.
+              idx = 0u;
+              int count_processed = 0;
+              for (const std::pair<int64_t, backend::ResourceId> &stamped_resource_id :
+                   resource_buffer)
+              {
+
+                // We assume the frame of reference for the sensor system is the IMU
+                // frame.
+                const aslam::Transformation &T_M_I = poses_M_I[idx];
+                const aslam::Transformation T_G_S = T_G_M * T_M_I * T_I_S;
+                ++idx;
+
+                const int64_t timestamp_ns = stamped_resource_id.first;
+                // If the resource timestamp does not lie within the min and max
+                // timestamp of the vertices, we cannot interpolate the position.
+                if (timestamp_ns < min_timestamp_ns ||
+                    timestamp_ns > max_timestamp_ns)
                 {
-                  // Nothing to do here.
-                }
-                else
-                {
+                  LOG(WARNING) << "The optional depth resource at " << timestamp_ns
+                               << " is outside of the time range of the pose graph, "
+                               << "skipping.";
                   continue;
                 }
-                CHECK(!point_cloud.empty()) << "Vertex " << vertex_id << " frame "
-                                            << frame_idx << " has an empty point cloud!";
-                // convert point_cloud in camera coordinate to world coordinate
+
+                // Check if a point cloud is available.
+                resources::PointCloud point_cloud;
+                if (!vi_map.getOptionalSensorResource(
+                        mission, input_resource_type, sensor_or_camera_id,
+                        timestamp_ns, &point_cloud))
+                {
+                  LOG(FATAL) << "Cannot retrieve optional point cloud resources at "
+                             << "timestamp " << timestamp_ns << "!";
+                }
+
+                VLOG(3) << "Found point cloud at timestamp " << timestamp_ns;
+
+                // generate octomap
                 octomap::Pointcloud cloud;
                 Eigen::Vector3d point;
                 Eigen::Vector3d pointWorld;
-                // Compute complete transformation.
-                const aslam::Transformation T_I_C = n_camera.get_T_C_B(frame_idx).inverse();
-                const aslam::Transformation T_G_C = T_G_I * T_I_C;
-                Eigen::Isometry3d T(T_G_C.getTransformationMatrix());
+                Eigen::Isometry3d T(T_G_S.getTransformationMatrix());
+
                 for (size_t index = 0u; index < point_cloud.size(); index++)
                 {
                   point[0] = point_cloud.xyz[0 + 3 * index];
@@ -126,21 +243,27 @@ public:
                   cloud.push_back(pointWorld[0], pointWorld[1], pointWorld[2]);
                 }
                 tree.insertPointCloud(cloud, octomap::point3d(T(0, 3), T(1, 3), T(2, 3)));
+                count_processed++;
+
+                LOG(INFO) << "processed point cloud "<< count_processed 
+                << " The total number: " << resource_buffer.size():
               }
             }
-          });
+          }
+
           // write octomap to disk
           tree.updateInnerOccupancy();
+          std::cout << "save octomap to octomap.bt!" << std::endl;
           tree.writeBinary("octomap.bt");
 
           return common::kSuccess;
         },
 
-        "This command will run an awesome VI map algorithm.",
+        "This command will create a octomap from point cloud data.",
         common::Processing::Sync);
   }
 };
 
 // Finally, call the MAPLAB_CREATE_CONSOLE_PLUGIN macro to create your console
 // plugin.
-MAPLAB_CREATE_CONSOLE_PLUGIN(HelloWorldPlugin);
+MAPLAB_CREATE_CONSOLE_PLUGIN(OctoMapPlugin);
