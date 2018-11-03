@@ -19,5 +19,10 @@
   <depend>map_manager</depend>
   <depend>vi_map</depend>
   <depend>octomap</depend>
+  <depend>PCL</depend>
+  <depend>Pangolin</depend>
   <depend>eigen_catkin</depend>
+  <depend>opencv3_catkin</depend>
+  <depend>minkindr_conversions</depend>
+  <depend>geometry_msgs</depend>
 </package>

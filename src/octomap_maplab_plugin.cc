@@ -24,7 +24,22 @@
 #include <voxblox/integrator/tsdf_integrator.h>
 
 #include <octomap/octomap.h>
+#include <opencv2/highgui.hpp>
 #include <Eigen/Geometry>
+#include <ros/ros.h>
+#include <sensor_msgs/PointCloud2.h>
+#include <pcl/point_types.h> 
+#include <pcl/io/pcd_io.h> 
+#include <pcl/filters/voxel_grid.h>
+#include <pcl/visualization/pcl_visualizer.h>
+#include <pcl/filters/statistical_outlier_removal.h>
+#include <sensor_msgs/PointCloud2.h>
+#include <sensor_msgs/point_cloud2_iterator.h>
+#include <rosbag/bag.h>
+#include <tf_conversions/tf_eigen.h>
+#include <tf/transform_datatypes.h>
+#include <geometry_msgs/TransformStamped.h>
+#include <minkindr_conversions/kindr_msg.h>
 // Your new plugin needs to derive from ConsolePluginBase.
 // (Alternatively, you can derive from ConsolePluginBaseWithPlotter if you need
 // RViz plotting abilities for your VI map.)
@@ -91,7 +106,7 @@ public:
           // Get and lock the map which blocks all other access to the map.
           vi_map::VIMapManager::MapWriteAccess map =
               map_manager.getMapWriteAccess(selected_map_key);
-          const vi_map::VIMap& vi_map = *map;
+          const vi_map::VIMap &vi_map = *map;
 
           // get mission lists
           vi_map::MissionIdList mission_ids;
@@ -99,9 +114,20 @@ public:
 
           // set resource type 17 pointcloudxyz
           const backend::ResourceType input_resource_type = static_cast<backend::ResourceType>(
-                17);
+              17);
+
           // octomap tree
           octomap::OcTree tree(0.05);
+
+          // pcl point cloud
+          typedef pcl::PointXYZ PointT;
+          typedef pcl::PointCloud<PointT> PointCloud;
+          PointCloud::Ptr pointCloud(new PointCloud);
+
+          // rosbag
+          rosbag::Bag bag;
+          bag.open("/home/nrslnuc2/Dataset/pointcloud_processed.bag", rosbag::bagmode::Write);
+
           for (const vi_map::MissionId &mission_id : mission_ids)
           {
             VLOG(1) << "Integrating mission " << mission_id;
@@ -197,10 +223,29 @@ public:
                    resource_buffer)
               {
 
+                /*
+                while(1)
+                {
+                  int k = cv::waitKey(100);
+                  if ( k == 110)
+                  {
+                    std::cout << "process next point cloud" << std::endl;
+                    break;
+                  } 
+                  else if ( k == -1 )
+                    continue;
+                  else
+                    std::cout << " k = " << k << std::endl;
+                }
+                */
+
                 // We assume the frame of reference for the sensor system is the IMU
                 // frame.
                 const aslam::Transformation &T_M_I = poses_M_I[idx];
-                const aslam::Transformation T_G_S = T_G_M * T_M_I * T_I_S;
+
+                // !!!!!! T_I_S actually is T_S_I
+                const aslam::Transformation T_G_S = T_G_M * T_M_I * T_I_S.inverse();
+                
                 ++idx;
 
                 const int64_t timestamp_ns = stamped_resource_id.first;
@@ -229,10 +274,32 @@ public:
 
                 // generate octomap
                 octomap::Pointcloud cloud;
+
+                // generate pcd file
+                PointCloud::Ptr current(new PointCloud);
+
+                // publish point cloud to rviz
+                ros::NodeHandle nh;
+	              ros::Publisher point_cloud_pub = nh.advertise<sensor_msgs::PointCloud2>( "/point_cloud", 10);
+                sensor_msgs::PointCloud2Ptr pc = boost::make_shared<sensor_msgs::PointCloud2>();
+
+                pc->header.frame_id = "/map";
+                pc->header.stamp = ros::Time::now();
+                pc->width = point_cloud.size();
+	              pc->height = 1;
+                pc->is_bigendian = false;
+                pc->is_dense = false;
+
+                sensor_msgs::PointCloud2Modifier pc_modifier(*pc);
+                pc_modifier.setPointCloud2FieldsByString(1, "xyz");
+
+                sensor_msgs::PointCloud2Iterator<float> iter_x(*pc, "x");
+                sensor_msgs::PointCloud2Iterator<float> iter_y(*pc, "y");
+                sensor_msgs::PointCloud2Iterator<float> iter_z(*pc, "z");
+
                 Eigen::Vector3d point;
                 Eigen::Vector3d pointWorld;
                 Eigen::Isometry3d T(T_G_S.getTransformationMatrix());
-
                 for (size_t index = 0u; index < point_cloud.size(); index++)
                 {
                   point[0] = point_cloud.xyz[0 + 3 * index];
@@ -240,13 +307,39 @@ public:
                   point[2] = point_cloud.xyz[2 + 3 * index];
 
                   pointWorld = T * point;
+
                   cloud.push_back(pointWorld[0], pointWorld[1], pointWorld[2]);
+                  
+                  // ros point cloud
+                  *iter_x = pointWorld[0];
+                  *iter_y = pointWorld[1];
+                  *iter_z = pointWorld[2];
+    
+                  //*iter_x = point[0];
+                  //*iter_y = point[1];
+                  //*iter_z = point[2];
+                  ++iter_x, ++iter_y, ++iter_z;
                 }
+
+                // save point cloud
+                bag.write("/point_cloud", pc->header.stamp, *pc);
+
+                // save the transform imu->map
+                geometry_msgs::TransformStamped msg_stamped;
+                geometry_msgs::Transform msg;
+                tf::transformKindrToMsg(T_G_M * T_M_I, &msg);
+                msg_stamped.child_frame_id = "imu";
+                msg_stamped.header.stamp = pc->header.stamp;
+                msg_stamped.header.frame_id = "map";
+                msg_stamped.transform = msg;
+                bag.write("/sensor_pose", pc->header.stamp, msg_stamped);
+                
+                // octomap
                 tree.insertPointCloud(cloud, octomap::point3d(T(0, 3), T(1, 3), T(2, 3)));
                 count_processed++;
 
-                LOG(INFO) << "processed point cloud "<< count_processed 
-                << " The total number: " << resource_buffer.size():
+                LOG(INFO) << "processed point cloud " << count_processed
+                          << " The total number: " << resource_buffer.size();
               }
             }
           }
