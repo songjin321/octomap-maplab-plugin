@@ -40,6 +40,13 @@
 #include <tf/transform_datatypes.h>
 #include <geometry_msgs/TransformStamped.h>
 #include <minkindr_conversions/kindr_msg.h>
+#include <gflags/gflags.h>
+#include <cstdlib>
+DEFINE_string(
+    refined_bag_file, "",
+    "the bag file path which storage point cloud represented in the map coordinate and "
+    "refined imu->map transform.");
+
 // Your new plugin needs to derive from ConsolePluginBase.
 // (Alternatively, you can derive from ConsolePluginBaseWithPlotter if you need
 // RViz plotting abilities for your VI map.)
@@ -126,7 +133,7 @@ public:
 
           // rosbag
           rosbag::Bag bag;
-          bag.open("/home/nrslnuc2/Dataset/pointcloud_processed.bag", rosbag::bagmode::Write);
+          bag.open(std::string(std::getenv("HOME")) + "/Documents/pointcloud_processed.bag", rosbag::bagmode::Write);
 
           for (const vi_map::MissionId &mission_id : mission_ids)
           {
@@ -279,8 +286,8 @@ public:
                 PointCloud::Ptr current(new PointCloud);
 
                 // publish point cloud to rviz
-                ros::NodeHandle nh;
-	              ros::Publisher point_cloud_pub = nh.advertise<sensor_msgs::PointCloud2>( "/point_cloud", 10);
+                // ros::NodeHandle nh;
+	        // ros::Publisher point_cloud_pub = nh.advertise<sensor_msgs::PointCloud2>( "/point_cloud", 10);
                 sensor_msgs::PointCloud2Ptr pc = boost::make_shared<sensor_msgs::PointCloud2>();
 
                 pc->header.frame_id = "/map";
@@ -308,7 +315,7 @@ public:
 
                   pointWorld = T * point;
 
-                  cloud.push_back(pointWorld[0], pointWorld[1], pointWorld[2]);
+                  // cloud.push_back(pointWorld[0], pointWorld[1], pointWorld[2]);
                   
                   // ros point cloud
                   *iter_x = pointWorld[0];
@@ -332,10 +339,10 @@ public:
                 msg_stamped.header.stamp = pc->header.stamp;
                 msg_stamped.header.frame_id = "map";
                 msg_stamped.transform = msg;
-                bag.write("/sensor_pose", pc->header.stamp, msg_stamped);
+                bag.write("/map_imu_pose", pc->header.stamp, msg_stamped);
                 
                 // octomap
-                tree.insertPointCloud(cloud, octomap::point3d(T(0, 3), T(1, 3), T(2, 3)));
+                // tree.insertPointCloud(cloud, octomap::point3d(T(0, 3), T(1, 3), T(2, 3)));
                 count_processed++;
 
                 LOG(INFO) << "processed point cloud " << count_processed
@@ -345,9 +352,9 @@ public:
           }
 
           // write octomap to disk
-          tree.updateInnerOccupancy();
-          std::cout << "save octomap to octomap.bt!" << std::endl;
-          tree.writeBinary("octomap.bt");
+          // tree.updateInnerOccupancy();
+          // std::cout << "save octomap to octomap.bt!" << std::endl;
+          // tree.writeBinary("octomap.bt");
 
           return common::kSuccess;
         },
